@@ -1,0 +1,38 @@
+services:
+  triage-api:
+    build:
+      context: ./api
+      dockerfile: Dockerfile
+
+    container_name: triage-vllm-cpu
+
+    ports:
+      - "8000:8000"
+
+    volumes:
+      - ./model:/model:ro
+
+    environment:
+      VLLM_CPU_KVCACHE_SPACE: "2"
+      VLLM_CPU_OMP_THREADS_BIND: "auto"
+
+    restart: unless-stopped
+
+  triage-frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+
+    container_name: triage-streamlit
+
+    ports:
+      - "8501:8501"
+
+    environment:
+      VLLM_BASE_URL: "http://triage-api:8000/v1"
+      VLLM_MODEL_NAME: "triage-model"
+
+    depends_on:
+      - triage-api
+
+    restart: unless-stopped
