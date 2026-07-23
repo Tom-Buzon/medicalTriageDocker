@@ -1,1 +1,11 @@
+.env
+__pycache__/
+*.pyc
+.vscode/
+.idea/
+.DS_Store
+
 model/
+cache/
+hf-cache/
+_save_history/

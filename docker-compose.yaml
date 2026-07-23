@@ -1,3 +1,5 @@
+name: medicaldocker
+
 services:
   triage-api:
     build:
@@ -6,15 +8,18 @@ services:
 
     container_name: triage-vllm-cpu
 
+    env_file:
+      - .env
+
     ports:
       - "8000:8000"
 
-    volumes:
-      - ./model:/model:ro
-
     environment:
-      VLLM_CPU_KVCACHE_SPACE: "2"
+      VLLM_CPU_KVCACHE_SPACE: "${VLLM_CPU_KVCACHE_SPACE:-2}"
       VLLM_CPU_OMP_THREADS_BIND: "auto"
+
+    volumes:
+      - hf-cache:/root/.cache/huggingface
 
     restart: unless-stopped
 
@@ -30,9 +35,12 @@ services:
 
     environment:
       VLLM_BASE_URL: "http://triage-api:8000/v1"
-      VLLM_MODEL_NAME: "triage-model"
+      VLLM_MODEL_NAME: "${SERVED_MODEL_NAME:-triage-model}"
 
     depends_on:
       - triage-api
 
     restart: unless-stopped
+
+volumes:
+  hf-cache:
