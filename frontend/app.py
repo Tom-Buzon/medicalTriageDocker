@@ -13,13 +13,13 @@ from openai import APIConnectionError, APITimeoutError, OpenAI
 # CONFIGURATION
 # ============================================================
 
-VLLM_BASE_URL = os.getenv(
-    "VLLM_BASE_URL",
+INFERENCE_BASE_URL = os.getenv(
+    "INFERENCE_BASE_URL",
     "http://triage-api:8000/v1",
 )
 
-VLLM_MODEL_NAME = os.getenv(
-    "VLLM_MODEL_NAME",
+SERVED_MODEL_NAME = os.getenv(
+    "SERVED_MODEL_NAME",
     "triage-model",
 )
 
@@ -136,7 +136,7 @@ st.caption(
 )
 
 client = OpenAI(
-    base_url=VLLM_BASE_URL,
+    base_url=INFERENCE_BASE_URL,
     api_key="unused",
     timeout=300,
 )
@@ -150,8 +150,8 @@ with st.sidebar:
         else:
             st.error("vLLM API is not available.")
 
-    st.code(VLLM_BASE_URL)
-    st.write(f"Model: `{VLLM_MODEL_NAME}`")
+    st.code(INFERENCE_BASE_URL)
+    st.write(f"Model: `{SERVED_MODEL_NAME}`")
 
 examples = {
     "Select an example": "",
@@ -204,7 +204,7 @@ if analyse:
 
             with st.spinner("The model is analysing the case..."):
                 response = client.completions.create(
-                    model=VLLM_MODEL_NAME,
+                    model=SERVED_MODEL_NAME,
                     prompt=prompt,
                     temperature=0.0,
                     max_tokens=90,

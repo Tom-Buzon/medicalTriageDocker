@@ -1,0 +1,15 @@
+.git
+.gitignore
+
+__pycache__
+*.pyc
+
+.vscode
+.idea
+
+.env
+
+requests
+
+cache
+hf-cache
