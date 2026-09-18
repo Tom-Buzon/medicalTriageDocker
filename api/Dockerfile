@@ -1,4 +1,4 @@
-FROM vllm/vllm-openai-cpu:latest-x86_64
+FROM vllm/vllm-openai-cpu:v0.29.0-x86_64
 
 ENV VLLM_CPU_KVCACHE_SPACE=2
 ENV VLLM_CPU_OMP_THREADS_BIND=auto

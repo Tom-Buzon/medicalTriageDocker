@@ -8,11 +8,15 @@ services:
 
     container_name: triage-vllm-cpu
 
+    shm_size: "1gb"
+
     env_file:
       - .env
 
     ports:
-      - "8000:8000"
+      # The API stays reachable from the host for local tests, but is never
+      # exposed on the EC2 public network interface.
+      - "127.0.0.1:8000:8000"
 
     environment:
       VLLM_CPU_KVCACHE_SPACE: "${VLLM_CPU_KVCACHE_SPACE:-2}"
@@ -21,7 +25,20 @@ services:
     volumes:
       - hf-cache:/root/.cache/huggingface
 
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/v1/models', timeout=5)"
+      interval: 15s
+      timeout: 10s
+      retries: 5
+      # Includes the first Hugging Face download and the CPU warm-up.
+      start_period: 20m
+
     restart: unless-stopped
+    stop_grace_period: 2m
 
   triage-frontend:
     build:
@@ -34,11 +51,24 @@ services:
       - "8501:8501"
 
     environment:
-      VLLM_BASE_URL: "http://triage-api:8000/v1"
-      VLLM_MODEL_NAME: "${SERVED_MODEL_NAME:-triage-model}"
+      INFERENCE_BASE_URL: "http://triage-api:8000/v1"
+      SERVED_MODEL_NAME: "${SERVED_MODEL_NAME:-triage-model}"
+      STREAMLIT_SERVER_BASE_URL_PATH: "${APP_URL_PATH:?Set APP_URL_PATH in .env}"
 
     depends_on:
-      - triage-api
+      triage-api:
+        condition: service_healthy
+
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import os, urllib.request; p=os.environ['STREAMLIT_SERVER_BASE_URL_PATH'].strip('/'); urllib.request.urlopen(f'http://127.0.0.1:8501/{p}/_stcore/health', timeout=5)"
+      interval: 15s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
 
     restart: unless-stopped
 

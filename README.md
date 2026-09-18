@@ -33,3 +33,8 @@ for medical triage classification.
 
 This project is a technical demonstration and does not provide medical
 advice, diagnosis, or treatment recommendations.
+
+## Deployment
+
+The step-by-step AWS EC2 POC deployment guide is available in
+[`MiseEnLigne.md`](MiseEnLigne.md).
