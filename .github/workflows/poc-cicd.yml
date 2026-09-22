@@ -1,0 +1,376 @@
+name: Medical Triage POC Deploy
+
+on:
+  workflow_dispatch:
+
+permissions:
+  id-token: write
+  contents: read
+
+concurrency:
+  group: medical-triage-poc-deploy
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+
+    env:
+      AWS_REGION: ${{ vars.AWS_REGION }}
+      EC2_INSTANCE_ID: ${{ vars.EC2_INSTANCE_ID }}
+      HF_MODEL_ID: ${{ vars.HF_MODEL_ID }}
+      EC2_PROJECT_DIR: ${{ vars.EC2_PROJECT_DIR }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Resolve current Hugging Face SHA
+        id: hf
+        run: |
+          HF_SHA="$(curl -fsSL \
+            "https://huggingface.co/api/models/${HF_MODEL_ID}" \
+            | python3 -c 'import sys,json; print(json.load(sys.stdin)["sha"])')"
+
+          test -n "$HF_SHA"
+
+          echo "sha=$HF_SHA" >> "$GITHUB_OUTPUT"
+          echo "Target HF SHA: ${HF_SHA:0:12}"
+
+      - name: Authenticate to AWS with OIDC
+        uses: aws-actions/configure-aws-credentials@v6.3.0
+        with:
+          role-to-assume: ${{ vars.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+
+      - name: Check EC2 state
+        id: ec2
+        run: |
+          STATE="$(aws ec2 describe-instances \
+            --instance-ids "$EC2_INSTANCE_ID" \
+            --query "Reservations[0].Instances[0].State.Name" \
+            --output text)"
+
+          echo "EC2 state: $STATE"
+          echo "state=$STATE" >> "$GITHUB_OUTPUT"
+
+          if [ "$STATE" != "running" ]; then
+            echo "EC2 is not running. Nothing will be deployed."
+          fi
+
+      - name: Verify SSM is online
+        if: steps.ec2.outputs.state == 'running'
+        run: |
+          STATUS="$(aws ssm describe-instance-information \
+            --filters "Key=InstanceIds,Values=$EC2_INSTANCE_ID" \
+            --query "InstanceInformationList[0].PingStatus" \
+            --output text)"
+
+          echo "SSM status: $STATUS"
+
+          if [ "$STATUS" != "Online" ]; then
+            echo "EC2 is running but SSM is not online."
+            exit 1
+          fi
+
+      - name: Prepare deployment script
+        if: steps.ec2.outputs.state == 'running'
+        env:
+          TARGET_CODE_SHA: ${{ github.sha }}
+          TARGET_HF_SHA: ${{ steps.hf.outputs.sha }}
+        run: |
+          cat > deploy.sh <<'SCRIPT'
+          #!/usr/bin/env bash
+          set -Eeuo pipefail
+
+          TARGET_CODE_SHA="$1"
+          TARGET_HF_SHA="$2"
+          PROJECT_DIR="$3"
+
+          cd "$PROJECT_DIR"
+
+          echo "=== Current deployment ==="
+
+          OLD_CODE_SHA="$(git rev-parse HEAD)"
+          OLD_MODEL_SHA="$(sed -n 's/^MODEL_REVISION=//p' .env | head -n 1)"
+
+          echo "Current code : $OLD_CODE_SHA"
+          echo "Target code  : $TARGET_CODE_SHA"
+          echo "Current model: $OLD_MODEL_SHA"
+          echo "Target model : $TARGET_HF_SHA"
+
+          if [ -z "$OLD_MODEL_SHA" ]; then
+            echo "ERROR: MODEL_REVISION is empty."
+            echo "Pin the current working model before enabling CI/CD."
+            exit 10
+          fi
+
+          if [ -n "$(git status --porcelain --untracked-files=no)" ]; then
+            echo "ERROR: tracked files have local modifications:"
+            git status --short
+            exit 11
+          fi
+
+          git fetch origin main
+          git cat-file -e "${TARGET_CODE_SHA}^{commit}"
+
+          CODE_CHANGED=0
+          MODEL_CHANGED=0
+
+          [ "$OLD_CODE_SHA" = "$TARGET_CODE_SHA" ] || CODE_CHANGED=1
+          [ "$OLD_MODEL_SHA" = "$TARGET_HF_SHA" ] || MODEL_CHANGED=1
+
+          if [ "$CODE_CHANGED" -eq 0 ] && [ "$MODEL_CHANGED" -eq 0 ]; then
+            echo "Already up to date."
+            exit 0
+          fi
+
+          ENV_BACKUP="$(mktemp)"
+          cp .env "$ENV_BACKUP"
+
+          ROLLBACK_NEEDED=1
+
+          rollback() {
+            echo "=== DEPLOYMENT FAILED: ROLLBACK ==="
+
+            git reset --hard "$OLD_CODE_SHA" || true
+            cp "$ENV_BACKUP" .env || true
+
+            docker compose up -d --build || true
+
+            echo "Rollback requested."
+          }
+
+          on_exit() {
+            RC=$?
+            trap - EXIT
+
+            if [ "$RC" -ne 0 ] && [ "$ROLLBACK_NEEDED" -eq 1 ]; then
+              rollback
+            fi
+
+            rm -f "$ENV_BACKUP"
+            exit "$RC"
+          }
+
+          trap on_exit EXIT
+
+          if [ "$CODE_CHANGED" -eq 1 ]; then
+            echo "Updating code to $TARGET_CODE_SHA"
+            git reset --hard "$TARGET_CODE_SHA"
+          fi
+
+          if [ "$MODEL_CHANGED" -eq 1 ]; then
+            echo "Updating model to $TARGET_HF_SHA"
+
+            if grep -q '^MODEL_REVISION=' .env; then
+              sed -i \
+                "s/^MODEL_REVISION=.*/MODEL_REVISION=$TARGET_HF_SHA/" \
+                .env
+            else
+              printf '\nMODEL_REVISION=%s\n' "$TARGET_HF_SHA" >> .env
+            fi
+          fi
+
+          docker compose config --quiet
+
+          if [ "$CODE_CHANGED" -eq 1 ]; then
+            echo "Reconciling application after code update..."
+            docker compose up -d --build
+
+          elif [ "$MODEL_CHANGED" -eq 1 ]; then
+            echo "Recreating only triage-api after model update..."
+            docker compose up -d --force-recreate triage-api
+          fi
+
+          echo "Waiting for vLLM..."
+
+          API_READY=0
+
+          for ATTEMPT in $(seq 1 100); do
+            if curl -fsS \
+              http://127.0.0.1:8000/v1/models \
+              >/dev/null; then
+
+              API_READY=1
+              break
+            fi
+
+            echo "vLLM not ready yet ($ATTEMPT/100)"
+            sleep 12
+          done
+
+          if [ "$API_READY" -ne 1 ]; then
+            echo "ERROR: vLLM did not become ready."
+            docker compose ps
+            docker compose logs --tail=200 triage-api
+            exit 20
+          fi
+
+          echo "Running API smoke test..."
+
+          curl -fsS \
+            -X POST \
+            http://127.0.0.1:8000/v1/completions \
+            -H 'Content-Type: application/json' \
+            --data-binary @requests/triage_request.json \
+            > /tmp/triage-smoke.json
+
+          python3 - <<'PY'
+          import json
+
+          with open("/tmp/triage-smoke.json", encoding="utf-8") as f:
+              response = json.load(f)
+
+          choices = response.get("choices") or []
+
+          if not choices or not choices[0].get("text"):
+              raise SystemExit("Smoke test returned no generated text")
+
+          print("API smoke test successful")
+          print(choices[0]["text"])
+          PY
+
+          APP_PATH="$(sed -n 's/^APP_URL_PATH=//p' .env | head -n 1)"
+
+          if [ -z "$APP_PATH" ]; then
+            echo "ERROR: APP_URL_PATH is empty."
+            exit 21
+          fi
+
+          echo "Waiting for Streamlit..."
+
+          FRONTEND_READY=0
+
+          for ATTEMPT in $(seq 1 30); do
+            if curl -fsSL \
+              "http://127.0.0.1:8501/${APP_PATH}" \
+              >/dev/null; then
+
+              FRONTEND_READY=1
+              break
+            fi
+
+            sleep 5
+          done
+
+          if [ "$FRONTEND_READY" -ne 1 ]; then
+            echo "ERROR: Streamlit did not become ready."
+            docker compose ps
+            docker compose logs --tail=100 triage-frontend
+            exit 22
+          fi
+
+          ROLLBACK_NEEDED=0
+
+          echo "=== DEPLOYMENT SUCCESSFUL ==="
+          echo "Code SHA : $TARGET_CODE_SHA"
+          echo "Model SHA: $TARGET_HF_SHA"
+
+          docker compose ps
+
+          rm -f "$ENV_BACKUP"
+          trap - EXIT
+          SCRIPT
+
+          export DEPLOY_B64="$(base64 -w0 deploy.sh)"
+
+          python3 - <<'PY'
+          import json
+          import os
+          import shlex
+
+          args = [
+              os.environ["TARGET_CODE_SHA"],
+              os.environ["TARGET_HF_SHA"],
+              os.environ["EC2_PROJECT_DIR"],
+          ]
+
+          run_command = (
+              "sudo -u ubuntu -H bash "
+              "/tmp/medical-triage-deploy.sh "
+              + " ".join(shlex.quote(x) for x in args)
+          )
+
+          payload = {
+              "InstanceIds": [os.environ["EC2_INSTANCE_ID"]],
+              "DocumentName": "AWS-RunShellScript",
+              "Comment": "Deploy Medical Triage POC",
+              "Parameters": {
+                  "commands": [
+                      "echo '%s' | base64 -d > /tmp/medical-triage-deploy.sh"
+                      % os.environ["DEPLOY_B64"],
+                      "chmod 755 /tmp/medical-triage-deploy.sh",
+                      run_command,
+                  ]
+              },
+          }
+
+          with open("send-command.json", "w", encoding="utf-8") as f:
+              json.dump(payload, f)
+          PY
+
+      - name: Deploy through SSM
+        id: ssm
+        if: steps.ec2.outputs.state == 'running'
+        run: |
+          COMMAND_ID="$(aws ssm send-command \
+            --cli-input-json file://send-command.json \
+            --query "Command.CommandId" \
+            --output text)"
+
+          echo "SSM command: $COMMAND_ID"
+          echo "command_id=$COMMAND_ID" >> "$GITHUB_OUTPUT"
+
+      - name: Wait for deployment result
+        if: steps.ec2.outputs.state == 'running'
+        env:
+          COMMAND_ID: ${{ steps.ssm.outputs.command_id }}
+        run: |
+          FINAL_STATUS=""
+
+          for ATTEMPT in $(seq 1 180); do
+
+            STATUS="$(aws ssm get-command-invocation \
+              --command-id "$COMMAND_ID" \
+              --instance-id "$EC2_INSTANCE_ID" \
+              --query "Status" \
+              --output text 2>/dev/null || echo Pending)"
+
+            echo "SSM status: $STATUS"
+
+            case "$STATUS" in
+              Success)
+                FINAL_STATUS="Success"
+                break
+                ;;
+
+              Failed|Cancelled|TimedOut|Cancelling)
+                FINAL_STATUS="$STATUS"
+                break
+                ;;
+
+              *)
+                sleep 10
+                ;;
+            esac
+          done
+
+          echo
+          echo "=== SSM OUTPUT ==="
+
+          aws ssm get-command-invocation \
+            --command-id "$COMMAND_ID" \
+            --instance-id "$EC2_INSTANCE_ID" \
+            --query '{
+              Status:Status,
+              Output:StandardOutputContent,
+              Error:StandardErrorContent
+            }' \
+            --output json
+
+          if [ "$FINAL_STATUS" != "Success" ]; then
+            echo "Deployment failed with status: $FINAL_STATUS"
+            exit 1
+          fi
